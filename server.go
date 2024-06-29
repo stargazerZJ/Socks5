@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/txthinking/runnergroup"
 	"io"
 	"net"
 	"strconv"
@@ -17,43 +16,91 @@ type Server struct {
 	Addr        string
 	TCPListener *net.TCPListener
 	Handler     Handler
-	EnableUDP   bool // Not implemented yet
+	EnableUDP   bool
 	EnableAuth  bool // Not implemented yet
-	RunnerGroup *runnergroup.RunnerGroup
+	LocalAddr   net.Addr
+	UDPListener *net.UDPConn
 }
 
 type Handler interface {
-	HandleConnect(s *Server, request *Socks5Request, clientConn *net.TCPConn) error // only return error if it's critical
-	HandleUDPAssociate(s *Server, request *Socks5Request, clientConn *net.TCPConn) error // only return error if it's critical
-	//HandleUDP(s *Server, diagram UDPDiagram, clientConn *net.UDPConn) error // Not implemented yet
+	HandleConnect(s *Server, request *Request, clientConn *net.TCPConn) error      // only return error if it's critical
+	HandleUDPAssociate(s *Server, request *Request, clientConn *net.TCPConn) error // only return error if it's critical
+	HandleUDP(s *Server, diagram *Datagram, clientConn *net.UDPConn) error         // only return error if it's critical
+	Start() error
+	Stop() error
 }
 
-type Socks5Request struct {
+type Request struct {
 	Cmd     byte
 	ATYP    byte
 	DstAddr []byte // for domains, this doesn't include the domain length byte
 	DstPort []byte
 }
 
+type Datagram struct {
+	ATYP    byte
+	DstAddr []byte // for domains, this doesn't include the domain length byte
+	DstPort []byte
+	Data    []byte
+}
+
 func (s *Server) ListenAndServe() error {
-	if s.TCPListener == nil {
-		tcpAddr, err := net.ResolveTCPAddr("tcp", s.Addr)
+	s.Handler.Start()
+
+	if s.EnableUDP {
+		udpAddr, err := net.ResolveUDPAddr("udp", s.Addr)
 		if err != nil {
+			s.Handler.Stop()
 			return err
 		}
-		tcpListener, err := net.ListenTCP("tcp", tcpAddr)
+		s.UDPListener, err = net.ListenUDP("udp", udpAddr)
 		if err != nil {
+			s.Handler.Stop()
 			return err
 		}
-		s.TCPListener = tcpListener
-	} else {
+		go func() {
+			for {
+				buf := make([]byte, 65507)
+				n, clientAddr, err := s.UDPListener.ReadFromUDP(buf)
+				if err != nil {
+					return
+				}
+				go func(buf []byte, n int, clientAddr net.Addr) {
+					datagram, err := NewDatagram(buf[:n])
+					if err != nil {
+						return
+					}
+					s.Handler.HandleUDP(s, datagram, s.UDPListener)
+				}(buf[:n], n, clientAddr)
+			}
+		}()
+	}
+
+	if s.TCPListener != nil {
+		s.UDPListener.Close()
+		s.Handler.Stop()
 		return fmt.Errorf("tcp listener already exists")
 	}
+	tcpAddr, err := net.ResolveTCPAddr("tcp", s.Addr)
+	if err != nil {
+		s.UDPListener.Close()
+		s.Handler.Stop()
+		return err
+	}
+	tcpListener, err := net.ListenTCP("tcp", tcpAddr)
+	if err != nil {
+		s.UDPListener.Close()
+		s.Handler.Stop()
+		return err
+	}
+	s.TCPListener = tcpListener
+
+	s.LocalAddr = s.TCPListener.Addr() // used by HandleUDPAssociate
 
 	for {
 		conn, err := s.TCPListener.AcceptTCP()
 		if err != nil {
-			return err
+			return nil
 		}
 		go func(conn *net.TCPConn) {
 			request, err := s.handshake(conn)
@@ -88,7 +135,12 @@ func (s *Server) Shutdown() error {
 	if err := s.TCPListener.Close(); err != nil {
 		return err
 	}
-	return nil
+	if s.EnableUDP {
+		if err := s.UDPListener.Close(); err != nil {
+			return err
+		}
+	}
+	return s.Handler.Stop()
 }
 
 func NewServer(address string, enableAuth bool, username, password string, enableUDP bool, handler Handler) (*Server, error) {
@@ -108,15 +160,14 @@ func NewServer(address string, enableAuth bool, username, password string, enabl
 	}
 
 	return &Server{
-		Addr:        address,
-		EnableUDP:   enableUDP,
-		EnableAuth:  enableAuth,
-		Handler:     handler,
-		RunnerGroup: runnergroup.New(),
+		Addr:       address,
+		EnableUDP:  enableUDP,
+		EnableAuth: enableAuth,
+		Handler:    handler,
 	}, nil
 }
 
-func (s *Server) handshake(conn *net.TCPConn) (*Socks5Request, error) {
+func (s *Server) handshake(conn *net.TCPConn) (*Request, error) {
 	// Read the first 2 bytes to get the version and number of methods
 	header := make([]byte, 2)
 	_, err := conn.Read(header)
@@ -203,7 +254,7 @@ func (s *Server) handshake(conn *net.TCPConn) (*Socks5Request, error) {
 		return nil, nil
 	}
 
-	request := &Socks5Request{
+	request := &Request{
 		Cmd:     requestHeader[1],
 		ATYP:    requestHeader[3],
 		DstAddr: addr[:addrLen],
@@ -217,6 +268,44 @@ func (s *Server) sendErrorReply(conn *net.TCPConn, rep byte) {
 	conn.Write([]byte{Socks5Ver, rep, 0x00, ATYPIPv4, 0, 0, 0, 0, 0, 0})
 }
 
+func NewDatagram(buf []byte) (*Datagram, error) {
+	if buf[0] != 0 || buf[1] != 0 {
+		return nil, fmt.Errorf("RSV should be 0")
+	}
+
+	frag := buf[2]
+	if frag != 0 {
+		return nil, fmt.Errorf("fragmentation is not supported")
+	}
+	atyp := buf[3]
+	addrLen := 0
+	switch atyp {
+	case ATYPIPv4:
+		addrLen = 4
+	case ATYPDomain:
+		addrLen = int(buf[4])
+		if addrLen == 0 {
+			return nil, fmt.Errorf("address length is 0")
+		}
+	case ATYPIPv6:
+		addrLen = 16
+	default:
+		return nil, fmt.Errorf("address type not supported")
+	}
+	addr := buf[4 : 4+addrLen]
+	port := buf[4+addrLen : 4+addrLen+2]
+	data := buf[4+addrLen+2:]
+	if atyp == ATYPDomain {
+		addr = addr[1:]
+	}
+	return &Datagram{
+		ATYP:    atyp,
+		DstAddr: addr,
+		DstPort: port,
+		Data:    data,
+	}, nil
+}
+
 func contains(slice []byte, item byte) bool {
 	for _, v := range slice {
 		if v == item {
@@ -228,7 +317,7 @@ func contains(slice []byte, item byte) bool {
 
 type DefaultHandler struct{}
 
-func (h *DefaultHandler) HandleConnect(s *Server, request *Socks5Request, clientConn *net.TCPConn) error {
+func (h *DefaultHandler) HandleConnect(s *Server, request *Request, clientConn *net.TCPConn) error {
 	var dstAddr string
 
 	switch request.ATYP {
@@ -278,7 +367,7 @@ func (h *DefaultHandler) HandleConnect(s *Server, request *Socks5Request, client
 	go func() {
 		_, _ = io.Copy(dstConn, clientConn)
 		dstConn.Close()
-        clientConn.Close()
+		clientConn.Close()
 	}()
 	_, err = io.Copy(clientConn, dstConn)
 	if err != nil && err != io.EOF {
@@ -288,6 +377,18 @@ func (h *DefaultHandler) HandleConnect(s *Server, request *Socks5Request, client
 	return nil
 }
 
-func (h *DefaultHandler) HandleUDPAssociate(s *Server, request *Socks5Request, clientConn *net.TCPConn) error {
+func (h *DefaultHandler) HandleUDPAssociate(s *Server, request *Request, clientConn *net.TCPConn) error {
 	return ErrNotImplemented
+}
+
+func (h *DefaultHandler) HandleUDP(s *Server, diagram *Datagram, clientConn *net.UDPConn) error {
+	return ErrNotImplemented
+}
+
+func (h *DefaultHandler) Start() error {
+	return nil
+}
+
+func (h *DefaultHandler) Stop() error {
+	return nil
 }
