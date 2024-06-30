@@ -1,12 +1,15 @@
 package Socks5
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/puzpuzpuz/xsync/v3"
 	"io"
 	"net"
 	"strconv"
+	"time"
 )
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -18,15 +21,14 @@ type Server struct {
 	Handler     Handler
 	EnableUDP   bool
 	EnableAuth  bool // Not implemented yet
-	LocalAddr   net.Addr
 	UDPListener *net.UDPConn
 }
 
 type Handler interface {
 	HandleConnect(s *Server, request *Request, clientConn *net.TCPConn) error      // only return error if it's critical
 	HandleUDPAssociate(s *Server, request *Request, clientConn *net.TCPConn) error // only return error if it's critical
-	HandleUDP(s *Server, diagram *Datagram, clientConn *net.UDPConn) error         // only return error if it's critical
-	Start() error
+	HandleUDP(s *Server, diagram *Datagram, clientAddr *net.UDPAddr) error         // only return error if it's critical
+	Start() error                                                                  // Non-blocking
 	Stop() error
 }
 
@@ -45,7 +47,10 @@ type Datagram struct {
 }
 
 func (s *Server) ListenAndServe() error {
-	s.Handler.Start()
+	err := s.Handler.Start()
+	if err != nil {
+		return err
+	}
 
 	if s.EnableUDP {
 		udpAddr, err := net.ResolveUDPAddr("udp", s.Addr)
@@ -59,18 +64,23 @@ func (s *Server) ListenAndServe() error {
 			return err
 		}
 		go func() {
+			buf := make([]byte, 65507)
 			for {
-				buf := make([]byte, 65507)
 				n, clientAddr, err := s.UDPListener.ReadFromUDP(buf)
 				if err != nil {
 					return
 				}
-				go func(buf []byte, n int, clientAddr net.Addr) {
+				//log.Println("Got UDP datagram from", clientAddr.String())
+				go func(buf []byte, n int, clientAddr *net.UDPAddr) {
 					datagram, err := NewDatagram(buf[:n])
 					if err != nil {
 						return
 					}
-					s.Handler.HandleUDP(s, datagram, s.UDPListener)
+					err = s.Handler.HandleUDP(s, datagram, clientAddr)
+					if err != nil {
+						s.UDPListener.Close()
+						return
+					}
 				}(buf[:n], n, clientAddr)
 			}
 		}()
@@ -95,17 +105,15 @@ func (s *Server) ListenAndServe() error {
 	}
 	s.TCPListener = tcpListener
 
-	s.LocalAddr = s.TCPListener.Addr() // used by HandleUDPAssociate
-
 	for {
 		conn, err := s.TCPListener.AcceptTCP()
 		if err != nil {
 			return nil
 		}
 		go func(conn *net.TCPConn) {
+			defer conn.Close()
 			request, err := s.handshake(conn)
 			if err != nil || request == nil {
-				conn.Close()
 				return
 			}
 			switch request.Cmd {
@@ -121,11 +129,10 @@ func (s *Server) ListenAndServe() error {
 						s.Shutdown()
 					}
 				} else {
-					conn.Close()
+					s.sendErrorReply(conn, RepCommandNotSupported)
 				}
 			default:
 				s.sendErrorReply(conn, RepCommandNotSupported)
-				conn.Close()
 			}
 		}(conn)
 	}
@@ -146,9 +153,6 @@ func (s *Server) Shutdown() error {
 func NewServer(address string, enableAuth bool, username, password string, enableUDP bool, handler Handler) (*Server, error) {
 	if enableAuth {
 		return nil, fmt.Errorf("authentication is not implemented")
-	}
-	if enableUDP {
-		return nil, fmt.Errorf("UDP is not implemented")
 	}
 
 	host, port, err := net.SplitHostPort(address)
@@ -315,24 +319,62 @@ func contains(slice []byte, item byte) bool {
 	return false
 }
 
-type DefaultHandler struct{}
+// return address:port
+func (r *Request) Address() (string, error) {
+	port := binary.BigEndian.Uint16(r.DstPort)
+	var address string
+	switch r.ATYP {
+	case ATYPIPv4:
+		address = fmt.Sprintf("%s:%d", net.IP(r.DstAddr).String(), port)
+	case ATYPIPv6:
+		address = fmt.Sprintf("[%s]:%d", net.IP(r.DstAddr).String(), port)
+	case ATYPDomain:
+		address = fmt.Sprintf("%s:%d", string(r.DstAddr), port)
+	default:
+		return "", fmt.Errorf("unsupported address type: %d", r.ATYP)
+	}
+	if address == "" {
+		return "", fmt.Errorf("failed to format address")
+	}
+	return address, nil
+}
+
+func (d *Datagram) Address() (string, error) {
+	port := binary.BigEndian.Uint16(d.DstPort)
+	var address string
+	switch d.ATYP {
+	case ATYPIPv4:
+		address = fmt.Sprintf("%s:%d", net.IP(d.DstAddr).String(), port)
+	case ATYPIPv6:
+		address = fmt.Sprintf("[%s]:%d", net.IP(d.DstAddr).String(), port)
+	case ATYPDomain:
+		address = fmt.Sprintf("%s:%d", string(d.DstAddr), port)
+	default:
+		return "", fmt.Errorf("unsupported address type: %d", d.ATYP)
+	}
+	if address == "" {
+		return "", fmt.Errorf("failed to format address")
+	}
+	return address, nil
+}
+
+type DefaultHandler struct {
+	associations *xsync.MapOf[string, association]
+	lastReqTime  *xsync.MapOf[string, time.Time]
+	ticker       *time.Ticker // used by the cleaner goroutine
+}
+
+type association struct {
+	remoteConn      *net.UDPConn
+	associationConn *net.TCPConn // when this is closed by the timer or the client, the association is deleted by HandleUDPAssociate
+}
 
 func (h *DefaultHandler) HandleConnect(s *Server, request *Request, clientConn *net.TCPConn) error {
-	var dstAddr string
-
-	switch request.ATYP {
-	case ATYPIPv4:
-		dstAddr = net.IP(request.DstAddr).String()
-	case ATYPIPv6:
-		dstAddr = fmt.Sprintf("[%s]", net.IP(request.DstAddr).String())
-	case ATYPDomain:
-		dstAddr = string(request.DstAddr)
-	default:
+	dstAddr, err := request.Address()
+	if err != nil {
 		s.sendErrorReply(clientConn, RepAddressNotSupported)
-		return fmt.Errorf("address type not supported")
+		return nil
 	}
-
-	dstAddr = fmt.Sprintf("%s:%d", dstAddr, binary.BigEndian.Uint16(request.DstPort))
 
 	// Establish a connection to the destination
 	dstConn, err := net.Dial("tcp", dstAddr)
@@ -378,17 +420,175 @@ func (h *DefaultHandler) HandleConnect(s *Server, request *Request, clientConn *
 }
 
 func (h *DefaultHandler) HandleUDPAssociate(s *Server, request *Request, clientConn *net.TCPConn) error {
-	return ErrNotImplemented
+	// Acquire the address that the client is going to use to send UDP datagrams
+	clientAddrStr, err := request.Address()
+	if err != nil {
+		s.sendErrorReply(clientConn, RepAddressNotSupported)
+		return nil
+	}
+	if bytes.Compare(request.DstPort, []byte{0, 0}) == 0 {
+		// RFC: If the client is not in possesion of the information at the time of the UDP ASSOCIATE, the client MUST use a port number and address of all zeros.
+		clientAddrStr = clientConn.RemoteAddr().String()
+	}
+	clientAddr, err := net.ResolveUDPAddr("udp", clientAddrStr)
+	if err != nil {
+		s.sendErrorReply(clientConn, RepAddressNotSupported)
+		return nil
+	}
+	//log.Println("The client wants to start a UDP talk using", clientAddr.String())
+
+	// Resolve the UDP address with port 0 to let the system assign an available port
+	udpAddr, err := net.ResolveUDPAddr("udp", "[::]:0")
+	if err != nil {
+		return fmt.Errorf("failed to resolve UDP address: %w", err)
+	}
+
+	// Create a UDP connection that will be used to send and receive UDP datagrams to the destination
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on UDP address: %w", err)
+	}
+	//log.Println("UDP ASSOCIATE", udpConn.LocalAddr().String())
+	defer udpConn.Close()
+
+	// send success reply to the user. use clientConn.LocalAddr() as the address to send the success to.
+	bndAddrTCP := clientConn.LocalAddr().(*net.TCPAddr)
+	bndAddrUDP := &net.UDPAddr{
+		IP:   bndAddrTCP.IP,
+		Port: bndAddrTCP.Port,
+	}
+
+	bndAddrBytes := bndAddrUDP.IP.To4()
+	atyp := ATYPIPv4
+	if bndAddrBytes == nil {
+		bndAddrBytes = bndAddrUDP.IP.To16()
+		atyp = ATYPIPv6
+	}
+	bndPort := make([]byte, 2)
+	binary.BigEndian.PutUint16(bndPort, uint16(bndAddrUDP.Port))
+	//log.Println("Reply address", bndAddrUDP.String())
+
+	reply := []byte{Socks5Ver, RepSuccess, 0x00, atyp}
+	reply = append(reply, bndAddrBytes...)
+	reply = append(reply, bndPort...)
+
+	_, err = clientConn.Write(reply)
+	if err != nil {
+		return nil
+	}
+
+	// Add the association to the map
+	h.associations.Store(clientAddrStr, association{
+		remoteConn:      udpConn,
+		associationConn: clientConn,
+	})
+
+	// Start a goroutine to copy data from udpConn to clientConn, with socks5 datagram header. Full cone NAT
+	go func() {
+		buf := make([]byte, 65507)
+		for {
+			n, addr, err := udpConn.ReadFromUDP(buf)
+			//log.Println("the Remote UDP conn got a datagram from", addr.String(), "length", n, "bytes")
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				return
+			}
+
+			// Create a SOCKS5 UDP datagram header
+			header := make([]byte, 10)
+			header[0] = 0x00 // Reserved
+			header[1] = 0x00 // Reserved
+			header[2] = 0x00 // Fragment number
+			header = header[:4]
+
+			// Address type and address
+			ip := addr.IP.To4()
+			if ip != nil {
+				header[3] = ATYPIPv4
+				header = append(header, ip...)
+			} else {
+				header[3] = ATYPIPv6
+				header = append(header, addr.IP...)
+			}
+
+			// Port
+			port := make([]byte, 2)
+			binary.BigEndian.PutUint16(port, uint16(addr.Port))
+			header = append(header, port...)
+
+			// Send the datagram with the header to the client
+			s.UDPListener.WriteToUDP(append(header, buf[:n]...), clientAddr)
+
+			// refresh the last request time
+			h.lastReqTime.Store(clientAddrStr, time.Now())
+		}
+	}()
+
+	// wait for the client to close the TCP connection and close closeChan
+	io.Copy(io.Discard, clientConn)
+	udpConn.Close()
+	h.associations.Delete(clientAddrStr)
+	h.lastReqTime.Delete(clientAddrStr)
+
+	return nil
 }
 
-func (h *DefaultHandler) HandleUDP(s *Server, diagram *Datagram, clientConn *net.UDPConn) error {
-	return ErrNotImplemented
+func (h *DefaultHandler) HandleUDP(s *Server, diagram *Datagram, clientAddr *net.UDPAddr) error {
+	dstAddrStr, err := diagram.Address()
+	if err != nil {
+		return nil
+	}
+
+	clientAddrStr := clientAddr.String()
+
+	association, ok := h.associations.Load(clientAddrStr)
+	if !ok {
+		return nil
+	}
+
+	dstAddr, err := net.ResolveUDPAddr("udp", dstAddrStr)
+	if err != nil {
+		return nil
+	}
+
+	association.remoteConn.WriteToUDP(diagram.Data, dstAddr)
+
+	// refresh the last request time
+	h.lastReqTime.Store(clientAddrStr, time.Now())
+	return nil
 }
 
 func (h *DefaultHandler) Start() error {
+	// start the cleanup goroutine that checks every 300 sec and close connections older than 60 sec
+	h.ticker = time.NewTicker(300 * time.Second)
+	go func() {
+		for range h.ticker.C {
+			now := time.Now()
+			h.lastReqTime.Range(func(key string, timestamp time.Time) bool {
+				if now.Sub(timestamp) > 60*time.Second {
+					association, ok := h.associations.Load(key)
+					if ok {
+						association.associationConn.Close()
+					}
+				}
+				return true
+			})
+		}
+	}()
 	return nil
 }
 
 func (h *DefaultHandler) Stop() error {
+	h.ticker.Stop()
 	return nil
+}
+
+// NewDefaultHandler creates a new DefaultHandler
+func NewDefaultHandler() *DefaultHandler {
+	return &DefaultHandler{
+		associations: xsync.NewMapOf[string, association](),
+		lastReqTime:  xsync.NewMapOf[string, time.Time](),
+	}
 }

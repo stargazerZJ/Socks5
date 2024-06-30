@@ -6,37 +6,34 @@ import (
 	"github.com/puzpuzpuz/xsync/v3"
 )
 
-type TimedValue[T any] struct {
-	Value     T
-	Timestamp time.Time
+type TimedMap[V any] struct {
+	data  *xsync.MapOf[string, V]
+	times *xsync.MapOf[string, time.Time]
 }
 
-type TimedMap[T any] struct {
-	data *xsync.MapOf[string, TimedValue[T]]
-}
-
-func NewTimedMap[T any]() *TimedMap[T] {
-	tm := &TimedMap[T]{
-		data: xsync.NewMapOf[string, TimedValue[T]](),
+func NewTimedMap[V any]() *TimedMap[V] {
+	tm := &TimedMap[V]{
+		data:  xsync.NewMapOf[string, V](),
+		times: xsync.NewMapOf[string, time.Time](),
 	}
 	go tm.cleanerThread()
 	return tm
 }
 
-func (tm *TimedMap[T]) Set(key string, value T) {
-	tm.data.Store(key, TimedValue[T]{Value: value, Timestamp: time.Now()})
+func (tm *TimedMap[V]) Set(key string, value V) {
+	tm.data.Store(key, value)
+	tm.times.Store(key, time.Now())
 }
 
-func (tm *TimedMap[T]) Get(key string) (T, bool) {
-	if timedValue, exists := tm.data.Load(key); exists {
-		tm.data.Store(key, TimedValue[T]{Value: timedValue.Value, Timestamp: time.Now()})
-		return timedValue.Value, true
+func (tm *TimedMap[V]) Get(key string) (V, bool) {
+	value, exists := tm.data.Load(key)
+	if exists {
+		tm.times.Store(key, time.Now()) // Reset timeout
 	}
-	var zero T
-	return zero, false
+	return value, exists
 }
 
-func (tm *TimedMap[T]) cleanerThread() {
+func (tm *TimedMap[V]) cleanerThread() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
@@ -45,11 +42,12 @@ func (tm *TimedMap[T]) cleanerThread() {
 	}
 }
 
-func (tm *TimedMap[T]) cleanExpired() {
+func (tm *TimedMap[V]) cleanExpired() {
 	now := time.Now()
-	tm.data.Range(func(key string, timedValue TimedValue[T]) bool {
-		if now.Sub(timedValue.Timestamp) > 300*time.Second {
+	tm.times.Range(func(key string, timestamp time.Time) bool {
+		if now.Sub(timestamp) > 300*time.Second {
 			tm.data.Delete(key)
+			tm.times.Delete(key)
 		}
 		return true
 	})
