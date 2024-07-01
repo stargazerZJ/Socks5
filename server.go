@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/puzpuzpuz/xsync/v3"
 	"io"
+	"log"
 	"net"
 	"strconv"
 	"time"
@@ -48,6 +49,7 @@ type Datagram struct {
 
 func (s *Server) ListenAndServe() error {
 	err := s.Handler.Start()
+	defer s.Handler.Stop()
 	if err != nil {
 		return err
 	}
@@ -55,12 +57,11 @@ func (s *Server) ListenAndServe() error {
 	if s.EnableUDP {
 		udpAddr, err := net.ResolveUDPAddr("udp", s.Addr)
 		if err != nil {
-			s.Handler.Stop()
 			return err
 		}
 		s.UDPListener, err = net.ListenUDP("udp", udpAddr)
+		defer s.UDPListener.Close()
 		if err != nil {
-			s.Handler.Stop()
 			return err
 		}
 		go func() {
@@ -70,7 +71,6 @@ func (s *Server) ListenAndServe() error {
 				if err != nil {
 					return
 				}
-				//log.Println("Got UDP datagram from", clientAddr.String())
 				go func(buf []byte, n int, clientAddr *net.UDPAddr) {
 					datagram, err := NewDatagram(buf[:n])
 					if err != nil {
@@ -87,20 +87,14 @@ func (s *Server) ListenAndServe() error {
 	}
 
 	if s.TCPListener != nil {
-		s.UDPListener.Close()
-		s.Handler.Stop()
 		return fmt.Errorf("tcp listener already exists")
 	}
 	tcpAddr, err := net.ResolveTCPAddr("tcp", s.Addr)
 	if err != nil {
-		s.UDPListener.Close()
-		s.Handler.Stop()
 		return err
 	}
 	tcpListener, err := net.ListenTCP("tcp", tcpAddr)
 	if err != nil {
-		s.UDPListener.Close()
-		s.Handler.Stop()
 		return err
 	}
 	s.TCPListener = tcpListener
@@ -132,6 +126,7 @@ func (s *Server) ListenAndServe() error {
 					s.sendErrorReply(conn, RepCommandNotSupported)
 				}
 			default:
+				log.Println("Command not supported:", request.Cmd)
 				s.sendErrorReply(conn, RepCommandNotSupported)
 			}
 		}(conn)
@@ -287,8 +282,8 @@ func NewDatagram(buf []byte) (*Datagram, error) {
 	case ATYPIPv4:
 		addrLen = 4
 	case ATYPDomain:
-		addrLen = int(buf[4])
-		if addrLen == 0 {
+		addrLen = int(buf[4]) + 1
+		if addrLen == 1 {
 			return nil, fmt.Errorf("address length is 0")
 		}
 	case ATYPIPv6:
@@ -421,26 +416,42 @@ func (h *DefaultHandler) HandleConnect(s *Server, request *Request, clientConn *
 
 func (h *DefaultHandler) HandleUDPAssociate(s *Server, request *Request, clientConn *net.TCPConn) error {
 	// Acquire the address that the client is going to use to send UDP datagrams
+	if bytes.Equal(request.DstAddr, []byte{0, 0, 0, 0}) || bytes.Equal(request.DstAddr, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}) {
+		// RFC: If the client is not in possession of the information at the time of the UDP ASSOCIATE, the client MUST use a port number and address of all zeros.
+		remoteAddr := clientConn.RemoteAddr().(*net.TCPAddr)
+		request.DstAddr = remoteAddr.IP
+		if remoteAddr.IP.To4() != nil {
+			request.ATYP = ATYPIPv4
+		} else {
+			request.ATYP = ATYPIPv6
+		}
+		if bytes.Equal(request.DstPort, []byte{0, 0}) {
+			log.Println("The client uses all zeros address and port")
+			port := make([]byte, 2)
+			binary.BigEndian.PutUint16(port, uint16(remoteAddr.Port))
+			request.DstPort = port
+		} else {
+			log.Println("The client uses all zeros address and a specific port")
+		}
+	}
+
 	clientAddrStr, err := request.Address()
 	if err != nil {
 		s.sendErrorReply(clientConn, RepAddressNotSupported)
 		return nil
 	}
-	if bytes.Compare(request.DstPort, []byte{0, 0}) == 0 {
-		// RFC: If the client is not in possesion of the information at the time of the UDP ASSOCIATE, the client MUST use a port number and address of all zeros.
-		clientAddrStr = clientConn.RemoteAddr().String()
-	}
+
 	clientAddr, err := net.ResolveUDPAddr("udp", clientAddrStr)
 	if err != nil {
 		s.sendErrorReply(clientConn, RepAddressNotSupported)
 		return nil
 	}
-	//log.Println("The client wants to start a UDP talk using", clientAddr.String())
+	log.Println("The client wants to start a UDP talk using", clientAddr.String())
 
 	// Resolve the UDP address with port 0 to let the system assign an available port
 	udpAddr, err := net.ResolveUDPAddr("udp", "[::]:0")
 	if err != nil {
-		return fmt.Errorf("failed to resolve UDP address: %w", err)
+		return fmt.Errorf("failed to assign a UDP port: %w", err)
 	}
 
 	// Create a UDP connection that will be used to send and receive UDP datagrams to the destination
@@ -448,7 +459,7 @@ func (h *DefaultHandler) HandleUDPAssociate(s *Server, request *Request, clientC
 	if err != nil {
 		return fmt.Errorf("failed to listen on UDP address: %w", err)
 	}
-	//log.Println("UDP ASSOCIATE", udpConn.LocalAddr().String())
+	log.Println("UDP ASSOCIATE", udpConn.LocalAddr().String())
 	defer udpConn.Close()
 
 	// send success reply to the user. use clientConn.LocalAddr() as the address to send the success to.
@@ -518,6 +529,9 @@ func (h *DefaultHandler) HandleUDPAssociate(s *Server, request *Request, clientC
 			binary.BigEndian.PutUint16(port, uint16(addr.Port))
 			header = append(header, port...)
 
+			log.Println("the Remote UDP conn got a datagram from", addr.String(), "length", n, "bytes", "header", header, "data", buf[:n])
+			log.Println("Sending to the client", clientAddr.String())
+
 			// Send the datagram with the header to the client
 			s.UDPListener.WriteToUDP(append(header, buf[:n]...), clientAddr)
 
@@ -543,8 +557,11 @@ func (h *DefaultHandler) HandleUDP(s *Server, diagram *Datagram, clientAddr *net
 
 	clientAddrStr := clientAddr.String()
 
+	log.Println("Got UDP datagram from", clientAddr.String(), "to", dstAddrStr, "length", len(diagram.Data))
+
 	association, ok := h.associations.Load(clientAddrStr)
 	if !ok {
+		log.Println("No association found for", clientAddrStr, "dropping the datagram")
 		return nil
 	}
 
@@ -553,7 +570,10 @@ func (h *DefaultHandler) HandleUDP(s *Server, diagram *Datagram, clientAddr *net
 		return nil
 	}
 
-	association.remoteConn.WriteToUDP(diagram.Data, dstAddr)
+	_, err = association.remoteConn.WriteToUDP(diagram.Data, dstAddr)
+	if err != nil {
+		return nil
+	}
 
 	// refresh the last request time
 	h.lastReqTime.Store(clientAddrStr, time.Now())

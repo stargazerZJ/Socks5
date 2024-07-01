@@ -17,7 +17,7 @@ import (
 )
 
 func TestServerStart(t *testing.T) {
-	s, err := Socks5.NewServer("127.0.0.1:1082", false, "", "", true, Socks5.NewDefaultHandler())
+	s, err := Socks5.NewServer("127.0.0.1:1082", false, "", "", true, Socks5.NewLooseUDPHandler())
 	if err != nil {
 		log.Println(err)
 		return
@@ -31,7 +31,11 @@ func TestServerStart(t *testing.T) {
 }
 
 func TestServerStartAndStop(t *testing.T) {
-	s, err := Socks5.NewServer("127.0.0.1:1082", false, "", "", true, Socks5.NewDefaultHandler())
+	ServerStartAndStop(Socks5.NewTCPOnlyHandler(), false)
+}
+
+func ServerStartAndStop(handler Socks5.Handler, enableUDP bool) {
+	s, err := Socks5.NewServer("0.0.0.0:1082", false, "", "", enableUDP, handler)
 	if err != nil {
 		log.Println(err)
 		return
