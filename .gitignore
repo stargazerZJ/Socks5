@@ -23,3 +23,5 @@ go.work.sum
 
 # Ignore all .idea/ directories
 .idea/
+
+*_test
